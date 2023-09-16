@@ -19,12 +19,10 @@ use bitcoin::{
 };
 use bitcoin_slices::{bsl, Parse};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
-use rayon::iter::ParallelIterator;
-use rayon::prelude::IntoParallelIterator;
 
 use std::io::{self, ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::types::SerBlock;
@@ -103,7 +101,6 @@ impl Connection {
         R: Send + Sync,
     {
         self.blocks_duration.observe_duration("total", || {
-            let mut result = vec![];
             let blockhashes: Vec<BlockHash> = blockhashes.into_iter().collect();
             if blockhashes.is_empty() {
                 return Ok(vec![]);
@@ -112,32 +109,37 @@ impl Connection {
                 debug!("loading {} blocks", blockhashes.len());
                 self.req_send.send(Request::get_blocks(&blockhashes))
             })?;
+            let result = Mutex::new(vec![]);
 
-            for hash in blockhashes {
-                let block = self.blocks_duration.observe_duration("response", || {
+            rayon::scope(|s| {
+                for hash in blockhashes {
                     let block = self
-                        .blocks_recv
-                        .recv()
-                        .with_context(|| format!("failed to get block {}", hash))?;
-                    let header = bsl::BlockHeader::parse(&block[..])
-                        .expect("core returned invalid blockheader")
-                        .parsed_owned();
-                    ensure!(
-                        &header.block_hash_sha2()[..] == hash.as_byte_array(),
-                        "got unexpected block"
-                    );
-                    Ok(block)
-                })?;
-                result.push((hash, block));
-            }
+                        .blocks_duration
+                        .observe_duration("response", || {
+                            let block = self
+                                .blocks_recv
+                                .recv()
+                                .with_context(|| format!("failed to get block {}", hash))?;
+                            let header = bsl::BlockHeader::parse(&block[..])
+                                .expect("core returned invalid blockheader")
+                                .parsed_owned();
+                            ensure!(
+                                &header.block_hash_sha2()[..] == hash.as_byte_array(),
+                                "got unexpected block"
+                            );
+                            Ok(block)
+                        })
+                        .unwrap();
+                    s.spawn(|_| {
+                        let r = self
+                            .blocks_duration
+                            .observe_duration("process", || func(hash, block));
+                        result.lock().unwrap().push(r);
+                    });
+                }
+            });
 
-            Ok(result
-                .into_par_iter()
-                .map(|(hash, block)| {
-                    self.blocks_duration
-                        .observe_duration("process", || func(hash, block))
-                })
-                .collect())
+            Ok(result.into_inner().unwrap())
         })
     }
 
