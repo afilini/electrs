@@ -130,9 +130,12 @@ impl Connection {
                             Ok(block)
                         })
                         .unwrap();
-                    s.spawn(|_| {
-                        let r = self
-                            .blocks_duration
+
+                    let blocks_duration = &self.blocks_duration;
+                    let result = &result;
+                    let func = &func;
+                    s.spawn(move |_| {
+                        let r = blocks_duration
                             .observe_duration("process", || func(hash, block));
                         result.lock().unwrap().push(r);
                     });
